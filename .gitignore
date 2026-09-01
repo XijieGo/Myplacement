@@ -1,0 +1,10 @@
+/build/
+/build-cuda/
+/build-asan/
+/out/*
+!/out/README.md
+/output/
+*.bmp
+*.gds
+*.csv
+*.log
