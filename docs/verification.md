@@ -17,6 +17,23 @@
 - `out/verified/course-eplace-v1/adaptec4/adaptive-neumann-default-legalized/`；
 - `out/verified/course-eplace-v1/thin1/adaptive-neumann-default-legalized/`。
 
+## RUDY 拥塞代理的最终验证
+
+RUDY 是方向需求热点代理，不是技术相关 router overflow；公式、容量冻结及其物理边界见
+[rudy_routability.md](rudy_routability.md)。本表只列完成合法化后的最终数据库评分，验证栅格为
+128×128、验证容量系数为 1.5：
+
+| 基准 | 最终配置 | 相对 monitor 的最终 proxy overflow | 相对 monitor 的最大利用率 | 合法化 |
+|---|---|---:|---:|---|
+| `adaptec1` | Softplus-L2 / α=1.0 / s=0.60 / 96×96 | `0.025305 → 0.009242`（-63.5%） | `2.416 → 1.729`（-28.4%） | PASS |
+| `adaptec4` | Hinge-L4 / α=0.65 / s=0.95 / 112×112 | `0.846109 → 0.788076`（-6.9%） | `10.184 → 6.867`（-32.6%） | PASS |
+
+两项结果的 HPWL 也都下降（A1 -5.0%，A4 -3.8%）。完整参数扫描、被淘汰的“全局好看但合法化后变差”
+候选和可复跑命令见 [rudy_experiments.md](rudy_experiments.md)。原始最终报告在：
+
+- `out/verified/rudy-v2/a1_softplus_c100w060_legal/`；
+- `out/verified/rudy-v2/a4_hinge_l4_c065w095_grid112_legal/`。
+
 ## 验证规则
 
 - `overview.txt` 是最终布局的权威报告；其中必须有 `density_metric=course_eplace_v1`。

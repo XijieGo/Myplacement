@@ -1,16 +1,19 @@
 # 自适应闭环全局布局器
 
 默认的 `adaptive` 优化器将全局布局看作一个受反馈控制的连续优化过程，而不是按固定日程
-反复乘以某个参数。它仍然优化同一个核心目标：
+反复乘以某个参数。它优化以下可选扩展目标（RUDY 项默认关闭）：
 
 ```text
-f(x, y) = Wγ(x, y) + λ Eρ(x, y)
+f(x, y) = Wγ(x, y) + λ Eρ(x, y) + η E_RUDY(x, y)
 ```
 
 - `Wγ` 是 log-sum-exp 平滑线长；`γ` 越小，越接近真实 HPWL。
 - `Eρ` 是 DCT/Neumann 静电势能；密度过高的位置会产生把单元推开的梯度。其电荷、溢出率和
   分母统一采用 [`course_eplace_v1`](density_model.md) 的分层定义。
 - `λ` 决定此刻“降低拥挤”相对于“缩短连线”的权重。
+- `η E_RUDY` 默认关闭；启用后是方向区分的 RUDY **需求热点代理**，而不是没有技术层容量时虚构的
+  真实布线 overflow。其容量冻结、梯度归一化、次梯度和留出验证定义见
+  [rudy_routability.md](rudy_routability.md)。
 
 它与旧 `legacy` 模式共存，因而任何结论都可以用同一输入、种子、初始布局和迭代上限重跑
 验证。
@@ -31,8 +34,9 @@ f(x, y) = Wγ(x, y) + λ Eρ(x, y)
    交换。否则按比例回溯缩短步长并重算，最多 `maximum_backtracks` 次。
 7. 根据本轮 HPWL 增长和溢出改善动态改变 `λ`。密度长期停滞时增强排斥力；密度已经可控但
    HPWL 明显恶化时降低它。参数变化后会丢弃过期的曲率历史，避免将不同目标函数的梯度混用。
-8. 保存“达到真实设计密度约束的所有状态中 HPWL 最小者”；若尚不可行，则保存溢出最低者。
-   结束时恢复该检查点，而不是盲目输出最后一次迭代。
+8. 保存“达到真实设计密度约束的所有状态中最优者”；未启用 RUDY 时按 HPWL，启用时按固定
+   `HPWL + η*E_RUDY`，其中 `η*` 是冻结的满权重。若尚不可行，则保存溢出最低者。结束时恢复该
+   检查点，而不是盲目输出最后一次迭代。
 
 `GlobalPlacementOptions` 中的主要安全/控制参数都位于
 [`include/myplacement/placement/GlobalPlacer.hpp`](../include/myplacement/placement/GlobalPlacer.hpp)：
@@ -46,8 +50,9 @@ f(x, y) = Wγ(x, y) + λ Eρ(x, y)
 ```text
 iteration, hpwl, optimizer_overflow, design_overflow,
 smooth_wirelength, density_energy, objective, penalty, smoothing,
-step_size, maximum_displacement, gradient_norm, curvature, backtracks,
-momentum_restarted, accepted, best_checkpoint
+step_size, maximum_displacement, gradient_norm, curvature,
+rudy_energy, rudy_proxy_overflow, rudy_maximum_utilization, rudy_weight,
+backtracks, momentum_restarted, accepted, best_checkpoint, rudy_active
 ```
 
 其中 `optimizer_overflow` 包含 filler，反映优化器实际看到的空间压力；`design_overflow` 排除
@@ -55,6 +60,9 @@ filler，反映最终真实单元的密度。二者都保留固定端子和暗�
 目标密度缩放后的可移动宏块作为分母，详见 [density_model.md](density_model.md)。`overview.txt`
 还汇总接受/拒绝次数、动量重启数、恢复的最佳检查点以及溢出分子/分母。这样可以直接回答一次
 性能变化来自何处，而不是只比较最后一个 HPWL。
+
+启用 RUDY 时，`overview.txt` 还会给出优化网格的 `rudy_*` 和不参与目标函数的
+`rudy_validation_*`。后者只是在不同分辨率上检查代理是否泛化，不能替代真实全局路由器。
 
 ## 可复现实验
 

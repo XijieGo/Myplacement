@@ -8,6 +8,7 @@ verified/course-eplace-v1/                唯一可交付、已复核的课程�
 diagnostics/course-eplace-v1/
   cuda-validation/                         CPU/CUDA 数值一致性检查
   cuda-performance/                        已整理的单卡速度与显存记录
+  a100-detailed-placement/                 合法化后窗口重排的 QoR 研究与复跑说明
 scratch/                                   新试跑的默认输出；不作为证据
 archive/pre-course-eplace-v1/              旧密度口径历史
 archive/cuda-development/                  已知无效、替代的 CUDA 开发记录

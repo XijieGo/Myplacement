@@ -13,9 +13,11 @@ PlacementDatabase
         ↓
 random / cluster / quadratic initial placement
         ↓
-smooth wirelength + DCT-Neumann density-field global placement
+smooth wirelength + DCT-Neumann density-field + optional RUDY hotspot global placement
         ↓
 row-based legalization
+        ↓
+optional exact window detailed placement
         ↓
 BMP (CImg) + GDSII + CSV/TXT reports
 ```
@@ -26,8 +28,10 @@ BMP (CImg) + GDSII + CSV/TXT reports
 `out/verified/` 和后续创新的共同基线。
 
 - `cpu` 与 `cuda` 是同一条算法路径的数值执行后端，不是两份布局器；运行时通过
-  `--compute-backend` 选择。
+  `--compute-backend` 选择全局布局后端，通过 `--detailed-backend` 选择详细放置后端。
 - `legacy` 优化器与 `periodic` 密度场只保留为可复现的 A/B 回归基线，不能作为正式交付配置。
+- 可选的 RUDY 项是这条主路径上的 routability-aware 扩展：它优化方向性布线需求热点代理，
+  不会把缺少工艺轨道/层信息的 BookShelf 输入误报为真实 router overflow。
 - `build/`、`build-cuda/` 和 `build-asan/` 都是可再生成的构建产物，不属于源代码版本分支。
 
 这一区分使项目既保留可验证的对照能力，又不会出现多个“都像正式版本”的实现。
@@ -41,7 +45,7 @@ Myplacement/
 │   ├── core/Geometry.hpp           # 二维点、矩形、重叠面积
 │   ├── model/PlacementDatabase.hpp # Module / Pin / Net / SiteRow
 │   ├── io/BookshelfParser.hpp      # BookShelf 前端
-│   ├── metrics/Metrics.hpp         # HPWL、密度网格、溢出率
+│   ├── metrics/                    # HPWL、密度网格、RUDY 热点代理
 │   ├── placement/                  # 初始布局、全局布局、合法化接口
 │   └── export/                     # BMP 与 GDSII 导出接口
 ├── src/
@@ -50,12 +54,14 @@ Myplacement/
 │   ├── metrics/                    # 指标实现
 │   ├── placement/
 │   │   ├── GlobalPlacer.cpp         # 公开全局布局 facade / 策略分发
+│   │   ├── DetailedPlacer.cpp        # 合法化后的精确局部重排参考实现
 │   │   ├── GlobalPlacementInternal.hpp # placement 私有算法入口
 │   │   ├── GlobalPlacementSupport.hpp/.cpp # adaptive 与 legacy 共用的密度/filler 服务
 │   │   ├── AdaptiveGlobalPlacer.cpp # 闭环优化器实现
 │   │   ├── LegacyGlobalPlacer.cpp   # 保留的开环 A/B 基线
 │   │   ├── CudaPlacementBackend.*    # CUDA 后端接口与无 CUDA 时的安全 stub
 │   │   ├── cuda/CudaPlacementBackend.cu # GPU 线长、密度与 DCT 数值内核
+│   │   ├── cuda/CudaDetailedPlacementBackend.cu # GPU 四单元 warp 级候选评估
 │   │   └── ...                      # 初始布局、DCT 场、合法化
 │   ├── export/                     # CImg / GDSII 实现
 │   └── app/main.cpp                # 命令行编排层
@@ -92,6 +98,8 @@ Myplacement/
 | 5. 全局布局 | 平滑线长梯度 + DCT/Neumann 频域密度场 + 自适应闭环 Nesterov + filler |
 | 6. 结果展示 | CImg 生成 BMP；自包含 GDSII 矩形导出，可用 KLayout 打开 |
 | 7. 合法化 | 宏块贪心避障 + 标准单元行分配 + 行内等距/二次（isotonic）压缩 |
+| 创新扩展 | 冻结容量、解析次梯度、梯度归一化和留出栅格验证的 RUDY 拥塞热点代理 |
+| QoR 扩展 | 合法化后严格改善 HPWL 的窗口重排；四单元 CUDA 路径一次评估 24 个合法排列 |
 
 ### 三种初始布局
 
@@ -121,10 +129,22 @@ filler 方程和验证见 [docs/density_model.md](docs/density_model.md)，闭�
 [docs/adaptive_global_optimizer.md](docs/adaptive_global_optimizer.md)。默认迭代预算为 280，但一旦真实
 设计密度连续满足约束就会提前停止；实验若需要严格同预算对照，应显式传入 `--iterations`。
 
+若显式启用 `--routability-model`，目标还会加入冻结容量的 RUDY 热点能量；定义、可解释边界与
+课程基准的合法化后验证见 [docs/rudy_routability.md](docs/rudy_routability.md) 和
+[docs/rudy_experiments.md](docs/rudy_experiments.md)。
+
 ### 合法化
 
 标准单元先在少量邻近行中选择有剩余容量的候选槽，再在每一行中做加权 isotonic 回归。这等价于
 在“无重叠、保持顺序”的约束下最小化与全局布局目标位置的偏移，属于 Abacus 思路的行内二次优化。
+
+### 合法化后的详细放置
+
+`--detailed-placement window --detailed-window 4 --detailed-passes 2` 会在合法化后对同一连续行区间的
+单元做全排列重排。每一个被接受的 move 都在 CPU 上重新计算精确受影响-net HPWL，并保持行、site grid
+和区间宽度，因此不会破坏合法性。CUDA 构建还可用 `--detailed-backend cuda` 将四单元的 24 个排列交给
+一个 warp 并行评分；GPU 只提供候选，CPU 仍负责精确验收。完整的 QoR 实验、GPU 边界及复跑规则见
+[docs/a100_quality_strategy.md](docs/a100_quality_strategy.md)。
 
 ## 构建
 
@@ -220,6 +240,11 @@ ctest --test-dir build-asan --output-on-failure
 --target-density <value>   目标密度
 --no-global                只运行初始布局
 --no-legalize              不运行合法化
+--legalizer abacus|greedy  默认 Abacus；greedy 仅用于可复现 A/B 基线
+--detailed-placement none|swap|window  合法化后的局部详细放置（默认 none）
+--detailed-backend cpu|cuda|auto  详细放置后端（默认 cpu；CUDA 仅支持四单元窗口）
+--detailed-passes <count>  详细放置 pass 数
+--detailed-window <count>  窗口大小，2..6；CUDA 路径固定为 4
 --no-bmp / --no-gds        关闭相应导出
 --parse-only               只解析并检查输入
 ```
@@ -236,10 +261,11 @@ ctest --test-dir build-asan --output-on-failure
 02_initial_selected.bmp    选中方法的初始布局
 03_global.bmp              全局布局结果
 04_legalized.bmp           合法化结果
+05_detailed.bmp            详细放置结果（启用时）
 initial_comparison.csv     三种初始方法的 HPWL、时间、迭代次数
 global_history.csv         每轮目标函数、HPWL、两类课程口径溢出率、步长、曲率、回溯、重启和检查点
 placement.gds              以不同层表示标准单元 / 宏 / 固定单元的 GDSII 文件
-overview.txt               最终对象数、HPWL、密度口径/分子/分母/暗区、合法性摘要
+overview.txt               最终对象数、HPWL、密度口径/分子/分母/暗区、合法性及详细放置摘要
 ```
 
 BMP 可直接在服务器上生成，不需要图形桌面。`placement.gds` 可下载后在 KLayout 打开；当前

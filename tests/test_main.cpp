@@ -7,6 +7,9 @@ int main() {
     try {
         myplacement::test::runDensityFieldTests();
         myplacement::test::runDensityModelTests();
+        myplacement::test::runRudyTests();
+        myplacement::test::runLegalizerTests();
+        myplacement::test::runDetailedPlacementTests();
         myplacement::test::runPlacementFlowTests();
         std::cout << "All MyPlacement tests passed.\n";
         return 0;

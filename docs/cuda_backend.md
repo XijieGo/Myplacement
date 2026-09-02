@@ -20,6 +20,28 @@ CPU：闭环控制、候选接受、坐标边界夹紧、检查点、合法化�
 当前 CUDA 仅支持默认的 `adaptive + neumann` 组合。`legacy` 和 `periodic` 是 CPU A/B 基线：显式
 请求 `--compute-backend cuda` 时会给出明确错误；`auto` 则安全回退到 CPU。
 
+## CUDA 合法化后详细放置
+
+CUDA 构建还包含一条独立的详细放置后端：在已经合法的连续行窗口中，对四个标准单元的 `4! = 24` 个
+排序并行评分。一个窗口对应一个 32-thread CUDA block，前 24 个线程各计算一个排列受影响 net 的局部
+HPWL。GPU 返回最优候选后，CPU 会在当前数据库上重新计算精确 HPWL，只有严格改善才写回；因此不同
+窗口的并发评分不会因为跨窗口 net 的陈旧信息造成质量退化。
+
+```bash
+./build-cuda/myplace examples/tiny/tiny.aux \
+  --detailed-placement window --detailed-backend cuda \
+  --detailed-passes 2 --detailed-window 4 --gpu-device 1
+```
+
+`cuda` 详细后端只支持 `window + size=4`；`auto` 在 CUDA 不可用或窗口不兼容时回退到 CPU，`cpu` 则是
+全排列参考实现。GPU 异常会恢复进入该阶段前的 module 位置和 orientation，避免回退路径接到半完成布局。
+`overview.txt` 会记录 `detailed_backend_requested`、实际使用后端、GPU 编号、显存预算、窗口数和候选数。
+
+共享服务器的大基准不要直接执行上述 tiny 命令模式。应使用
+`scripts/run_detailed_gpu_study.sh`：它会连续两次确认 GPU 1--4 的利用率低于阈值并保留显存余量，当前
+高利用率卡会被拒绝而不是抢占。完整 QoR 对照与 GPU 运行时证据边界见
+[a100_quality_strategy.md](a100_quality_strategy.md)。
+
 ## 构建与运行
 
 普通 CPU 构建不依赖 NVIDIA 环境：

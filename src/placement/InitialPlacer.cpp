@@ -31,6 +31,32 @@ std::string lower(std::string value) {
     return value;
 }
 
+bool isKnownInitialMethod(InitialMethod method) {
+    switch (method) {
+        case InitialMethod::Random:
+        case InitialMethod::Clustering:
+        case InitialMethod::Quadratic: return true;
+    }
+    return false;
+}
+
+void validateInitialPlacementOptions(InitialMethod method, const InitialPlacementOptions& options) {
+    if (!isKnownInitialMethod(method)) {
+        throw std::invalid_argument("Unknown initial placement method value.");
+    }
+    if (method == InitialMethod::Clustering &&
+        (options.target_cluster_size == 0U || options.maximum_cluster_size == 0U ||
+         options.cluster_relaxation_iterations < 0)) {
+        throw std::invalid_argument("Clustering initial-placement options are outside their valid range.");
+    }
+    if (method == InitialMethod::Quadratic &&
+        (options.quadratic_outer_iterations <= 0 || options.quadratic_solver_iterations <= 0 ||
+         !std::isfinite(options.quadratic_tolerance) || options.quadratic_tolerance <= 0.0 ||
+         !std::isfinite(options.minimum_distance) || options.minimum_distance <= 0.0)) {
+        throw std::invalid_argument("Quadratic initial-placement options are outside their valid range.");
+    }
+}
+
 class DisjointSet {
 public:
     explicit DisjointSet(std::size_t count) : parent_(count), size_(count, 1U) {
@@ -396,6 +422,7 @@ InitialMethod parseInitialMethod(const std::string& value) {
 
 InitialPlacementResult InitialPlacer::run(PlacementDatabase& database, InitialMethod method,
                                           const InitialPlacementOptions& options) const {
+    validateInitialPlacementOptions(method, options);
     const auto started = std::chrono::steady_clock::now();
     InitialPlacementResult result;
     result.method = method;

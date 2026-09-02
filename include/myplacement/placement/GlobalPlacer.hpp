@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "myplacement/metrics/Metrics.hpp"
+#include "myplacement/metrics/Rudy.hpp"
 #include "myplacement/placement/ElectrostaticField.hpp"
 
 namespace myplacement {
@@ -53,6 +54,20 @@ struct GlobalPlacementOptions {
     int feasible_refinement_iterations = 12;
     std::size_t maximum_fillers = 50000;
     std::uint64_t seed = 2026;
+    // BookShelf has no routing tracks or layer capacities.  This optional
+    // term optimizes a clearly labelled RUDY demand-hotspot proxy, rather than
+    // claiming signoff-router overflow.
+    RudyOptions rudy_options;
+    // Optional held-out RUDY resolution used only for post-run diagnostics.
+    // It is calibrated at the same reference state as the objective grid but
+    // never contributes a force, so it detects grid-specific proxy gaming.
+    int rudy_validation_bins = 0;
+    // Kept separate from the objective capacity factor so parameter sweeps
+    // can be assessed under one stable held-out threshold.
+    double rudy_validation_capacity_factor = 1.50;
+    double routability_start_overflow = 0.20;
+    double routability_weight_scale = 0.20;
+    int routability_ramp_iterations = 24;
     DensityFieldBoundary density_field_boundary = DensityFieldBoundary::Neumann;
     ComputeBackend compute_backend = ComputeBackend::Cpu;
     // This project is hosted on a shared server where placement jobs may use
@@ -78,10 +93,15 @@ struct GlobalPlacementIteration {
     double maximum_displacement = 0.0;
     double gradient_norm = 0.0;
     double curvature = 0.0;
+    double rudy_energy = 0.0;
+    double rudy_proxy_overflow = 0.0;
+    double rudy_maximum_utilization = 0.0;
+    double rudy_weight = 0.0;
     int backtracks = 0;
     bool momentum_restarted = false;
     bool accepted = false;
     bool best_checkpoint = false;
+    bool rudy_active = false;
 };
 
 struct GlobalPlacementResult {
@@ -101,6 +121,10 @@ struct GlobalPlacementResult {
     ComputeBackend compute_backend_used = ComputeBackend::Cpu;
     int cuda_device_used = -1;
     std::size_t cuda_reserved_memory_bytes = 0;
+    RudyMetrics rudy_metrics;
+    double rudy_energy_after = 0.0;
+    RudyMetrics rudy_validation_metrics;
+    double rudy_validation_energy_after = 0.0;
     std::vector<GlobalPlacementIteration> history;
 };
 

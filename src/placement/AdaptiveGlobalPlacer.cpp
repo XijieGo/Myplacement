@@ -91,9 +91,11 @@ struct ObjectiveMetrics {
     double hpwl = 0.0;
     double smooth_wirelength = 0.0;
     double density_energy = 0.0;
+    double rudy_energy = 0.0;
     double objective = 0.0;
     DensityMetrics optimizer_density;
     DensityMetrics design_density;
+    RudyMetrics rudy_metrics;
 };
 
 struct StateEvaluation {
@@ -104,6 +106,7 @@ struct StateEvaluation {
     double preconditioned_gradient_norm = 0.0;
     double wire_gradient_l1 = 0.0;
     double density_gradient_l1 = 0.0;
+    double rudy_gradient_l1 = 0.0;
 };
 
 class GlobalPlacementSession {
@@ -136,6 +139,37 @@ public:
     [[nodiscard]] std::size_t cudaReservedBytes() const {
         return cuda_backend_ ? cuda_backend_->reservedBytes() : 0U;
     }
+    [[nodiscard]] bool hasRudyCapacity() const { return rudy_capacity_.valid(); }
+    [[nodiscard]] bool hasRudyValidationCapacity() const { return rudy_validation_capacity_.valid(); }
+
+    // Capacity is a fixed reference, calibrated once when the controller
+    // first reaches the chosen density condition.  It must not follow later
+    // placements, otherwise the optimizer could reduce its own penalty by
+    // silently relaxing the target.
+    void activateRudy() {
+        if (rudy_capacity_.valid()) return;
+        const RudyEvaluation raw = evaluateRudy(database_, options_.rudy_options);
+        rudy_capacity_ = calibrateRudyCapacity(raw.metrics, options_.rudy_options.capacity_factor);
+        if (options_.rudy_validation_bins > 0) {
+            rudy_validation_options_ = options_.rudy_options;
+            rudy_validation_options_.columns = options_.rudy_validation_bins;
+            rudy_validation_options_.rows = options_.rudy_validation_bins;
+            rudy_validation_options_.capacity_factor = options_.rudy_validation_capacity_factor;
+            const RudyEvaluation validation_raw = evaluateRudy(database_, rudy_validation_options_);
+            rudy_validation_capacity_ =
+                calibrateRudyCapacity(validation_raw.metrics, rudy_validation_options_.capacity_factor);
+        }
+    }
+
+    [[nodiscard]] RudyEvaluation evaluateRudyAtCurrent(bool calculate_gradient) const {
+        if (!rudy_capacity_.valid()) return {};
+        return evaluateRudy(database_, options_.rudy_options, rudy_capacity_, calculate_gradient);
+    }
+
+    [[nodiscard]] RudyEvaluation evaluateRudyValidationAtCurrent() const {
+        if (!rudy_validation_capacity_.valid()) return {};
+        return evaluateRudy(database_, rudy_validation_options_, rudy_validation_capacity_);
+    }
 
     [[nodiscard]] std::vector<Vec2> capturePositions() const {
         std::vector<Vec2> positions(particleCount());
@@ -164,12 +198,17 @@ public:
     }
 
     [[nodiscard]] StateEvaluation evaluate(double smoothing, double penalty, double reference_penalty,
-                                           bool calculate_gradient) {
-        if (cuda_backend_) return evaluateCuda(smoothing, penalty, reference_penalty, calculate_gradient);
+                                           bool calculate_gradient, bool rudy_active = false,
+                                           double rudy_weight = 0.0) {
+        if (cuda_backend_) {
+            return evaluateCuda(smoothing, penalty, reference_penalty, calculate_gradient, rudy_active,
+                                rudy_weight);
+        }
 
         const DensityEvaluation density = evaluateDensity();
         const SmoothWirelengthEvaluation wire =
             evaluateSmoothWirelength(database_, smoothing, calculate_gradient);
+        const RudyEvaluation rudy = rudy_active ? evaluateRudyAtCurrent(calculate_gradient) : RudyEvaluation{};
 
         StateEvaluation result;
         result.metrics.hpwl = wire.hpwl;
@@ -177,11 +216,17 @@ public:
         result.metrics.density_energy = density.electrostatic_energy;
         result.metrics.optimizer_density = density.optimizer_density;
         result.metrics.design_density = density.design_density;
-        result.metrics.objective = wire.smooth_wirelength + penalty * density.electrostatic_energy;
+        result.metrics.rudy_energy = rudy.energy;
+        result.metrics.rudy_metrics = rudy.metrics;
+        result.metrics.objective =
+            wire.smooth_wirelength + penalty * density.electrostatic_energy + rudy_weight * rudy.energy;
         if (!std::isfinite(result.metrics.objective)) {
             throw std::runtime_error("Adaptive placement objective produced a non-finite value.");
         }
         if (!calculate_gradient) return result;
+        if (rudy_active && rudy.gradient.size() != database_.modules.size()) {
+            throw std::runtime_error("RUDY gradients do not match the module count.");
+        }
 
         result.raw_gradient.resize(particleCount());
         result.preconditioned_gradient.resize(particleCount());
@@ -192,8 +237,11 @@ public:
             const Module& module = database_.modules[movable_[index]];
             const double charge_area = densityChargeArea(module, options_.target_density);
             const Vec2 density_gradient = density_field_->sampleField(module.center) * (-charge_area);
+            const Vec2 rudy_gradient = rudy_active ? rudy.gradient[movable_[index]] : Vec2{};
             result.density_gradient_l1 += std::abs(density_gradient.x) + std::abs(density_gradient.y);
-            result.raw_gradient[index] = wire.gradient[movable_[index]] + density_gradient * penalty;
+            result.rudy_gradient_l1 += std::abs(rudy_gradient.x) + std::abs(rudy_gradient.y);
+            result.raw_gradient[index] = wire.gradient[movable_[index]] + density_gradient * penalty +
+                                         rudy_gradient * rudy_weight;
         }
         for (std::size_t index = 0; index < fillers_.size(); ++index) {
             const std::size_t particle = movable_.size() + index;
@@ -230,9 +278,10 @@ private:
     }
 
     [[nodiscard]] StateEvaluation evaluateCuda(double smoothing, double penalty, double reference_penalty,
-                                               bool calculate_gradient) {
+                                               bool calculate_gradient, bool rudy_active, double rudy_weight) {
         const CudaPlacementEvaluation cuda_evaluation =
             cuda_backend_->evaluate(capturePositions(), smoothing, calculate_gradient);
+        const RudyEvaluation rudy = rudy_active ? evaluateRudyAtCurrent(calculate_gradient) : RudyEvaluation{};
 
         StateEvaluation result;
         result.metrics.hpwl = cuda_evaluation.hpwl;
@@ -240,7 +289,10 @@ private:
         result.metrics.density_energy = cuda_evaluation.electrostatic_energy;
         result.metrics.optimizer_density = cuda_evaluation.optimizer_density;
         result.metrics.design_density = cuda_evaluation.design_density;
-        result.metrics.objective = result.metrics.smooth_wirelength + penalty * result.metrics.density_energy;
+        result.metrics.rudy_energy = rudy.energy;
+        result.metrics.rudy_metrics = rudy.metrics;
+        result.metrics.objective = result.metrics.smooth_wirelength + penalty * result.metrics.density_energy +
+                                   rudy_weight * rudy.energy;
         if (!std::isfinite(result.metrics.objective)) {
             throw std::runtime_error("CUDA adaptive placement objective produced a non-finite value.");
         }
@@ -248,6 +300,9 @@ private:
         if (cuda_evaluation.wire_gradient.size() != particleCount() ||
             cuda_evaluation.density_gradient.size() != particleCount()) {
             throw std::runtime_error("CUDA placement gradients do not match the particle count.");
+        }
+        if (rudy_active && rudy.gradient.size() != database_.modules.size()) {
+            throw std::runtime_error("RUDY gradients do not match the module count.");
         }
 
         result.raw_gradient.resize(particleCount());
@@ -259,9 +314,12 @@ private:
         for (std::size_t index = 0; index < particleCount(); ++index) {
             const Vec2 wire_gradient = cuda_evaluation.wire_gradient[index];
             const Vec2 density_gradient = cuda_evaluation.density_gradient[index];
+            const Vec2 rudy_gradient =
+                index < movable_.size() && rudy_active ? rudy.gradient[movable_[index]] : Vec2{};
             result.wire_gradient_l1 += std::abs(wire_gradient.x) + std::abs(wire_gradient.y);
             result.density_gradient_l1 += std::abs(density_gradient.x) + std::abs(density_gradient.y);
-            result.raw_gradient[index] = wire_gradient + density_gradient * penalty;
+            result.rudy_gradient_l1 += std::abs(rudy_gradient.x) + std::abs(rudy_gradient.y);
+            result.raw_gradient[index] = wire_gradient + density_gradient * penalty + rudy_gradient * rudy_weight;
             result.preconditioned_gradient[index] =
                 result.raw_gradient[index] * (preconditioner_base_[index] / density_strength);
             raw_gradient_squared_norm += squaredNorm(result.raw_gradient[index]);
@@ -325,6 +383,9 @@ private:
     std::vector<DensityFiller> fillers_;
     std::vector<double> density_deviation_;
     std::vector<double> preconditioner_base_;
+    RudyCapacity rudy_capacity_;
+    RudyOptions rudy_validation_options_;
+    RudyCapacity rudy_validation_capacity_;
 };
 
 struct StepEstimate {
@@ -343,6 +404,8 @@ struct Checkpoint {
     int iteration = 0;
     double hpwl = std::numeric_limits<double>::infinity();
     double overflow = std::numeric_limits<double>::infinity();
+    double rudy_energy = 0.0;
+    double selection_score = std::numeric_limits<double>::infinity();
     bool found = false;
     bool feasible = false;
 };
@@ -358,13 +421,35 @@ void validateAdaptiveOptions(const PlacementDatabase& database, const GlobalPlac
         options.maximum_momentum >= 1.0 || options.density_penalty_increase <= 1.0 ||
         options.density_penalty_decrease <= 0.0 || options.density_penalty_decrease >= 1.0 ||
         options.minimum_density_penalty <= 0.0 || options.maximum_density_penalty < options.minimum_density_penalty ||
-        options.smoothing_overflow_exponent <= 0.0 || options.feasible_refinement_iterations <= 0) {
+        options.smoothing_overflow_exponent <= 0.0 || options.feasible_refinement_iterations <= 0 ||
+        options.rudy_options.columns < 2 || options.rudy_options.rows < 2 ||
+        options.rudy_options.minimum_span_in_bins <= 0.0 || options.rudy_options.capacity_factor <= 0.0 ||
+        options.rudy_options.softplus_temperature <= 0.0 || options.routability_start_overflow < 0.0 ||
+        options.routability_weight_scale < 0.0 || options.routability_ramp_iterations <= 0 ||
+        options.rudy_validation_bins < 0 || options.rudy_validation_bins == 1 ||
+        !std::isfinite(options.rudy_options.minimum_span_in_bins) ||
+        !std::isfinite(options.rudy_options.capacity_factor) ||
+        !std::isfinite(options.rudy_options.softplus_temperature) ||
+        !std::isfinite(options.rudy_validation_capacity_factor) ||
+        options.rudy_validation_capacity_factor <= 0.0 ||
+        !std::isfinite(options.routability_start_overflow) ||
+        !std::isfinite(options.routability_weight_scale)) {
         throw std::invalid_argument("Adaptive global placement options are outside their valid range.");
     }
     const std::size_t columns = static_cast<std::size_t>(options.bins_x);
     const std::size_t rows = static_cast<std::size_t>(options.bins_y);
     if (columns > ElectrostaticField::kMaximumBinCount / rows) {
         throw std::invalid_argument("Density grid exceeds the safe one-million-bin workspace limit.");
+    }
+    const std::size_t rudy_columns = static_cast<std::size_t>(options.rudy_options.columns);
+    const std::size_t rudy_rows = static_cast<std::size_t>(options.rudy_options.rows);
+    if (rudy_columns > kMaximumDensityBinCount / rudy_rows) {
+        throw std::invalid_argument("RUDY grid exceeds the safe one-million-bin workspace limit.");
+    }
+    if (options.rudy_validation_bins > 0 &&
+        static_cast<std::size_t>(options.rudy_validation_bins) >
+            kMaximumDensityBinCount / static_cast<std::size_t>(options.rudy_validation_bins)) {
+        throw std::invalid_argument("RUDY validation grid exceeds the safe one-million-bin workspace limit.");
     }
 }
 
@@ -471,17 +556,26 @@ void validateAdaptiveOptions(const PlacementDatabase& database, const GlobalPlac
     return clamp(penalty, minimum_penalty, maximum_penalty);
 }
 
+[[nodiscard]] double checkpointScore(const ObjectiveMetrics& metrics, double routability_weight) {
+    return metrics.hpwl + routability_weight * metrics.rudy_energy;
+}
+
 void considerCheckpoint(Checkpoint& best_feasible, Checkpoint& best_fallback, const std::vector<Vec2>& positions,
                         const ObjectiveMetrics& metrics, int iteration, const GlobalPlacementOptions& options,
-                        bool& is_new_best) {
+                        double routability_weight, bool& is_new_best) {
     is_new_best = false;
     const double overflow = metrics.design_density.normalized_overflow;
     const bool feasible = overflow <= options.maximum_bin_overflow;
-    if (feasible && (!best_feasible.found || metrics.hpwl < best_feasible.hpwl)) {
+    const double selection_score = checkpointScore(metrics, routability_weight);
+    if (feasible &&
+        (!best_feasible.found || selection_score < best_feasible.selection_score - 1e-10 ||
+         (std::abs(selection_score - best_feasible.selection_score) <= 1e-10 && metrics.hpwl < best_feasible.hpwl))) {
         best_feasible.positions = positions;
         best_feasible.iteration = iteration;
         best_feasible.hpwl = metrics.hpwl;
         best_feasible.overflow = overflow;
+        best_feasible.rudy_energy = metrics.rudy_energy;
+        best_feasible.selection_score = selection_score;
         best_feasible.found = true;
         best_feasible.feasible = true;
         is_new_best = true;
@@ -493,10 +587,24 @@ void considerCheckpoint(Checkpoint& best_feasible, Checkpoint& best_fallback, co
         best_fallback.iteration = iteration;
         best_fallback.hpwl = metrics.hpwl;
         best_fallback.overflow = overflow;
+        best_fallback.rudy_energy = metrics.rudy_energy;
+        best_fallback.selection_score = selection_score;
         best_fallback.found = true;
         best_fallback.feasible = false;
         is_new_best = true;
     }
+}
+
+void refreshCheckpointRudyScore(GlobalPlacementSession& session, Checkpoint& checkpoint, double smoothing,
+                                double penalty, double reference_penalty, double routability_weight) {
+    if (!checkpoint.found) return;
+    const std::vector<Vec2> current_positions = session.capturePositions();
+    session.applyPositions(checkpoint.positions);
+    const StateEvaluation evaluation =
+        session.evaluate(smoothing, penalty, reference_penalty, false, true, routability_weight);
+    checkpoint.rudy_energy = evaluation.metrics.rudy_energy;
+    checkpoint.selection_score = checkpointScore(evaluation.metrics, routability_weight);
+    session.applyPositions(current_positions);
 }
 
 [[nodiscard]] double momentumAlignment(const std::vector<Vec2>& velocity,
@@ -511,7 +619,8 @@ void considerCheckpoint(Checkpoint& best_feasible, Checkpoint& best_fallback, co
 GlobalPlacementIteration makeHistoryRow(int iteration, const ObjectiveMetrics& metrics, double penalty,
                                         double smoothing, double step_size, double maximum_displacement,
                                         double gradient_norm, double curvature, int backtracks, bool restarted,
-                                        bool accepted, bool best_checkpoint) {
+                                        bool accepted, bool best_checkpoint, double rudy_weight,
+                                        bool rudy_active) {
     GlobalPlacementIteration row;
     row.iteration = iteration;
     row.hpwl = metrics.hpwl;
@@ -526,10 +635,15 @@ GlobalPlacementIteration makeHistoryRow(int iteration, const ObjectiveMetrics& m
     row.maximum_displacement = maximum_displacement;
     row.gradient_norm = gradient_norm;
     row.curvature = curvature;
+    row.rudy_energy = metrics.rudy_energy;
+    row.rudy_proxy_overflow = metrics.rudy_metrics.proxy_overflow;
+    row.rudy_maximum_utilization = metrics.rudy_metrics.maximum_utilization;
+    row.rudy_weight = rudy_weight;
     row.backtracks = backtracks;
     row.momentum_restarted = restarted;
     row.accepted = accepted;
     row.best_checkpoint = best_checkpoint;
+    row.rudy_active = rudy_active;
     return row;
 }
 
@@ -566,6 +680,43 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
     double penalty = clamp(raw_penalty, options.minimum_density_penalty, options.maximum_density_penalty);
     const double reference_penalty = penalty;
     initial_evaluation = session.evaluate(smoothing, penalty, reference_penalty, true);
+
+    const bool rudy_requested = options.rudy_options.penalty_model != RudyPenaltyModel::Disabled;
+    bool rudy_active = false;
+    int rudy_accepted_age = 0;
+    double rudy_target_weight = 0.0;
+    double rudy_weight = 0.0;
+    const auto refreshRudyWeight = [&]() {
+        if (!rudy_active) return false;
+        const double progress = std::min(
+            1.0, static_cast<double>(rudy_accepted_age + 1) /
+                     static_cast<double>(std::max(1, options.routability_ramp_iterations)));
+        const double updated_weight = rudy_target_weight * progress;
+        const bool changed =
+            std::abs(updated_weight - rudy_weight) > 1e-12 * std::max({1.0, std::abs(updated_weight), std::abs(rudy_weight)});
+        rudy_weight = updated_weight;
+        return changed;
+    };
+    const auto activateRudy = [&](StateEvaluation& evaluation) {
+        session.activateRudy();
+        rudy_active = true;
+        // Match the route-gradient L1 norm to a controlled fraction of the
+        // pre-existing wire-plus-density force, following the normalization
+        // strategy used by modern routability-aware placers.
+        const StateEvaluation probe = session.evaluate(smoothing, penalty, reference_penalty, true, true, 0.0);
+        const double base_gradient_l1 = probe.wire_gradient_l1 + penalty * probe.density_gradient_l1;
+        rudy_target_weight = probe.rudy_gradient_l1 > kEpsilon
+                                 ? options.routability_weight_scale * base_gradient_l1 / probe.rudy_gradient_l1
+                                 : 0.0;
+        rudy_accepted_age = 0;
+        rudy_weight = 0.0;
+        refreshRudyWeight();
+        evaluation = session.evaluate(smoothing, penalty, reference_penalty, true, true, rudy_weight);
+    };
+    if (rudy_requested &&
+        initial_evaluation.metrics.design_density.normalized_overflow <= options.routability_start_overflow) {
+        activateRudy(initial_evaluation);
+    }
     double last_optimizer_overflow = initial_evaluation.metrics.optimizer_density.normalized_overflow;
     double last_step_size = initialStepSize(initial_evaluation,
                                             options.initial_movement_in_bins * session.minimumBinLength());
@@ -574,7 +725,7 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
     Checkpoint best_fallback;
     bool initial_is_best = false;
     considerCheckpoint(best_feasible, best_fallback, current_positions, initial_evaluation.metrics, 0, options,
-                       initial_is_best);
+                       rudy_target_weight, initial_is_best);
 
     int momentum_age = 0;
     int objective_worse_streak = 0;
@@ -583,16 +734,34 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
 
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
         StateEvaluation current_evaluation;
+        bool rudy_just_activated = false;
         if (iteration == 0) {
             current_evaluation = std::move(initial_evaluation);
         } else {
             smoothing = smoothingFromOverflow(options, session.maximumBinLength(), last_optimizer_overflow,
                                               initial_overflow);
+            if (rudy_active && refreshRudyWeight()) {
+                previous_gradient.clear();
+                previous_gradient_positions.clear();
+                has_previous_gradient = false;
+            }
             session.applyPositions(current_positions);
-            current_evaluation = session.evaluate(smoothing, penalty, reference_penalty, true);
+            current_evaluation =
+                session.evaluate(smoothing, penalty, reference_penalty, true, rudy_active, rudy_weight);
+        }
+        if (rudy_requested && !rudy_active &&
+            current_evaluation.metrics.design_density.normalized_overflow <= options.routability_start_overflow) {
+            activateRudy(current_evaluation);
+            refreshCheckpointRudyScore(session, best_feasible, smoothing, penalty, reference_penalty,
+                                       rudy_target_weight);
+            previous_gradient.clear();
+            previous_gradient_positions.clear();
+            has_previous_gradient = false;
+            std::fill(velocity.begin(), velocity.end(), Vec2{});
+            rudy_just_activated = true;
         }
 
-        bool restarted = objective_worse_streak >= 2;
+        bool restarted = objective_worse_streak >= 2 || rudy_just_activated;
         bool momentum_used = false;
         std::vector<Vec2> base_positions = current_positions;
         const StateEvaluation* base_evaluation = &current_evaluation;
@@ -609,7 +778,8 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
                 }
                 session.applyPositions(base_positions);
                 base_positions = session.capturePositions();
-                lookahead_evaluation = session.evaluate(smoothing, penalty, reference_penalty, true);
+                lookahead_evaluation =
+                    session.evaluate(smoothing, penalty, reference_penalty, true, rudy_active, rudy_weight);
                 if (lookahead_evaluation.metrics.objective >
                     current_evaluation.metrics.objective * (1.0 + options.hpwl_growth_restart_threshold)) {
                     restarted = true;
@@ -655,7 +825,7 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
                     break;
                 }
                 StateEvaluation candidate_evaluation =
-                    session.evaluate(smoothing, penalty, reference_penalty, false);
+                    session.evaluate(smoothing, penalty, reference_penalty, false, rudy_active, rudy_weight);
                 if (acceptsCandidate(base_evaluation->metrics, candidate_evaluation.metrics,
                                      proposal.predicted_reduction, options)) {
                     accepted = true;
@@ -719,8 +889,9 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
             }
             last_optimizer_overflow = accepted_evaluation.metrics.optimizer_density.normalized_overflow;
             considerCheckpoint(best_feasible, best_fallback, current_positions, accepted_evaluation.metrics,
-                               iteration + 1, options, new_best_checkpoint);
+                               iteration + 1, options, rudy_target_weight, new_best_checkpoint);
             ++result.accepted_iterations;
+            if (rudy_active) ++rudy_accepted_age;
             if (accepted_evaluation.metrics.design_density.normalized_overflow <= options.maximum_bin_overflow) {
                 ++feasible_refinement_iterations;
             } else {
@@ -729,7 +900,8 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
             result.history.push_back(makeHistoryRow(iteration + 1, accepted_evaluation.metrics, penalty_used,
                                                     smoothing, used_step_size, used_maximum_displacement,
                                                     base_evaluation->preconditioned_gradient_norm, used_curvature,
-                                                    backtracks, restarted, true, new_best_checkpoint));
+                                                    backtracks, restarted, true, new_best_checkpoint, rudy_weight,
+                                                    rudy_active));
         } else {
             session.applyPositions(current_positions);
             std::fill(velocity.begin(), velocity.end(), Vec2{});
@@ -749,7 +921,7 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
             result.history.push_back(makeHistoryRow(iteration + 1, current_evaluation.metrics, penalty_used,
                                                     smoothing, 0.0, 0.0,
                                                     current_evaluation.preconditioned_gradient_norm, 0.0, backtracks,
-                                                    restarted, false, false));
+                                                    restarted, false, false, rudy_weight, rudy_active));
         }
         result.completed_iterations = iteration + 1;
         if (iteration >= 20 && feasible_refinement_iterations >= options.feasible_refinement_iterations) break;
@@ -766,6 +938,16 @@ GlobalPlacementResult runAdaptiveGlobalPlacement(PlacementDatabase& database, co
     result.hpwl_after = calculateHpwl(database).hpwl;
     result.overflow_after = calculateDensity(database, options.bins_x, options.bins_y, options.target_density)
                                 .normalized_overflow;
+    if (session.hasRudyCapacity()) {
+        const RudyEvaluation rudy_final = session.evaluateRudyAtCurrent(false);
+        result.rudy_metrics = rudy_final.metrics;
+        result.rudy_energy_after = rudy_final.energy;
+    }
+    if (session.hasRudyValidationCapacity()) {
+        const RudyEvaluation rudy_validation_final = session.evaluateRudyValidationAtCurrent();
+        result.rudy_validation_metrics = rudy_validation_final.metrics;
+        result.rudy_validation_energy_after = rudy_validation_final.energy;
+    }
     result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     return result;
 }

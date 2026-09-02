@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <initializer_list>
 #include <stdexcept>
 #include <string>
 
@@ -15,6 +17,81 @@ std::string lowercase(std::string value) {
         return static_cast<char>(std::tolower(character));
     });
     return value;
+}
+
+bool isKnownGlobalOptimizer(GlobalOptimizer optimizer) {
+    switch (optimizer) {
+        case GlobalOptimizer::Legacy:
+        case GlobalOptimizer::Adaptive: return true;
+    }
+    return false;
+}
+
+bool isKnownComputeBackend(ComputeBackend backend) {
+    switch (backend) {
+        case ComputeBackend::Cpu:
+        case ComputeBackend::Cuda:
+        case ComputeBackend::Auto: return true;
+    }
+    return false;
+}
+
+bool isKnownDensityFieldBoundary(DensityFieldBoundary boundary) {
+    switch (boundary) {
+        case DensityFieldBoundary::Periodic:
+        case DensityFieldBoundary::Neumann: return true;
+    }
+    return false;
+}
+
+bool isKnownRudyPenaltyModel(RudyPenaltyModel model) {
+    switch (model) {
+        case RudyPenaltyModel::Disabled:
+        case RudyPenaltyModel::HingeL2:
+        case RudyPenaltyModel::SoftplusL2:
+        case RudyPenaltyModel::HingeL4: return true;
+    }
+    return false;
+}
+
+bool allFinite(std::initializer_list<double> values) {
+    return std::all_of(values.begin(), values.end(), [](double value) { return std::isfinite(value); });
+}
+
+void validatePublicGlobalOptions(const GlobalPlacementOptions& options) {
+    if (!isKnownGlobalOptimizer(options.optimizer) || !isKnownComputeBackend(options.compute_backend) ||
+        !isKnownDensityFieldBoundary(options.density_field_boundary) ||
+        !isKnownRudyPenaltyModel(options.rudy_options.penalty_model) ||
+        !allFinite({options.target_density,
+                    options.maximum_bin_overflow,
+                    options.initial_smoothing,
+                    options.final_smoothing,
+                    options.maximum_movement_in_bins,
+                    options.penalty_growth,
+                    options.backtracking_ratio,
+                    options.armijo_coefficient,
+                    options.maximum_momentum,
+                    options.initial_movement_in_bins,
+                    options.objective_increase_for_density,
+                    options.hpwl_growth_restart_threshold,
+                    options.density_stall_threshold,
+                    options.density_penalty_increase,
+                    options.density_penalty_decrease,
+                    options.minimum_density_penalty,
+                    options.maximum_density_penalty,
+                    options.smoothing_overflow_exponent,
+                    options.rudy_options.minimum_span_in_bins,
+                    options.rudy_options.capacity_factor,
+                    options.rudy_options.softplus_temperature,
+                    options.rudy_validation_capacity_factor,
+                    options.routability_start_overflow,
+                    options.routability_weight_scale})) {
+        throw std::invalid_argument("Global placement options contain an unknown mode or non-finite value.");
+    }
+    if (options.compute_backend != ComputeBackend::Cpu &&
+        (options.cuda_device < 1 || options.cuda_device > 4 || options.maximum_cuda_memory_bytes == 0U)) {
+        throw std::invalid_argument("CUDA global placement requires a device in [1, 4] and a non-zero memory budget.");
+    }
 }
 
 }  // namespace
@@ -52,8 +129,13 @@ ComputeBackend parseComputeBackend(const std::string& value) {
 }
 
 GlobalPlacementResult GlobalPlacer::run(PlacementDatabase& database, const GlobalPlacementOptions& options) const {
+    validatePublicGlobalOptions(options);
     if (options.optimizer == GlobalOptimizer::Legacy && options.compute_backend == ComputeBackend::Cuda) {
         throw std::invalid_argument("The CUDA backend currently supports the adaptive optimizer only.");
+    }
+    if (options.optimizer == GlobalOptimizer::Legacy &&
+        options.rudy_options.penalty_model != RudyPenaltyModel::Disabled) {
+        throw std::invalid_argument("RUDY routability optimization currently supports the adaptive optimizer only.");
     }
     return options.optimizer == GlobalOptimizer::Adaptive
                ? detail::runAdaptiveGlobalPlacement(database, options)

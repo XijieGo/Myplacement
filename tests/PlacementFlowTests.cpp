@@ -8,6 +8,7 @@
 #include "myplacement/placement/InitialPlacer.hpp"
 #include "myplacement/placement/Legalizer.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -40,7 +41,8 @@ void expectFiniteGlobalHistory(const GlobalPlacementResult& result, bool expect_
     for (const GlobalPlacementIteration& row : result.history) {
         for (const double value : {row.hpwl, row.overflow, row.design_overflow, row.smooth_wirelength,
                                    row.density_energy, row.objective, row.penalty, row.smoothing, row.step_size,
-                                   row.maximum_displacement, row.gradient_norm, row.curvature}) {
+                                   row.maximum_displacement, row.gradient_norm, row.curvature, row.rudy_energy,
+                                   row.rudy_proxy_overflow, row.rudy_maximum_utilization, row.rudy_weight}) {
             expect(std::isfinite(value), "Global-placement diagnostic contains a non-finite value.");
         }
         expect(row.step_size >= 0.0 && row.maximum_displacement >= 0.0 && row.backtracks >= 0,
@@ -127,6 +129,27 @@ void runPlacementFlowTests() {
         expect(std::isfinite(calculateHpwl(database).hpwl), "Initial placement returned non-finite HPWL.");
     }
 
+    bool rejected_invalid_initial_options = false;
+    try {
+        PlacementDatabase invalid_options_database = BookshelfParser().parseAux(fixture);
+        InitialPlacementOptions invalid_options;
+        invalid_options.target_cluster_size = 0U;
+        initial_placer.run(invalid_options_database, InitialMethod::Clustering, invalid_options);
+    } catch (const std::invalid_argument&) {
+        rejected_invalid_initial_options = true;
+    }
+    expect(rejected_invalid_initial_options,
+           "Clustering initial placement accepted a zero target cluster size.");
+
+    bool rejected_unknown_initial_method = false;
+    try {
+        PlacementDatabase invalid_options_database = BookshelfParser().parseAux(fixture);
+        initial_placer.run(invalid_options_database, static_cast<InitialMethod>(99), {});
+    } catch (const std::invalid_argument&) {
+        rejected_unknown_initial_method = true;
+    }
+    expect(rejected_unknown_initial_method, "Initial placement accepted an unknown method value.");
+
     GlobalPlacementOptions global_options;
     global_options.iterations = 24;
     global_options.bins_x = 8;
@@ -139,6 +162,38 @@ void runPlacementFlowTests() {
     expect(global.best_checkpoint_iteration <= global.completed_iterations,
            "Adaptive checkpoint iteration is outside the run.");
     expectMovablesInCore(database);
+
+    PlacementDatabase rudy_database = BookshelfParser().parseAux(fixture);
+    InitialPlacementOptions rudy_initial_options;
+    rudy_initial_options.quadratic_outer_iterations = 3;
+    initial_placer.run(rudy_database, InitialMethod::Quadratic, rudy_initial_options);
+    GlobalPlacementOptions rudy_options;
+    rudy_options.iterations = 24;
+    rudy_options.bins_x = 8;
+    rudy_options.bins_y = 8;
+    rudy_options.maximum_fillers = 100;
+    rudy_options.rudy_options.columns = 8;
+    rudy_options.rudy_options.rows = 8;
+    rudy_options.rudy_options.capacity_factor = 1.10;
+    rudy_options.rudy_options.penalty_model = RudyPenaltyModel::SoftplusL2;
+    rudy_options.rudy_validation_bins = 16;
+    rudy_options.routability_start_overflow = 1.0;
+    rudy_options.routability_weight_scale = 0.10;
+    rudy_options.routability_ramp_iterations = 3;
+    const GlobalPlacementResult rudy_global = GlobalPlacer().run(rudy_database, rudy_options);
+    expectFiniteGlobalHistory(rudy_global, true);
+    expect(rudy_global.rudy_metrics.horizontal_capacity > 0.0 && rudy_global.rudy_metrics.vertical_capacity > 0.0,
+           "RUDY-enabled global placement did not calibrate fixed proxy capacities.");
+    expect(std::isfinite(rudy_global.rudy_energy_after) &&
+               std::isfinite(rudy_global.rudy_metrics.proxy_overflow),
+           "RUDY-enabled global placement did not report finite proxy diagnostics.");
+    expect(rudy_global.rudy_validation_metrics.horizontal_capacity > 0.0 &&
+               std::isfinite(rudy_global.rudy_validation_energy_after),
+           "RUDY-enabled global placement did not report its held-out proxy diagnostic.");
+    expect(std::any_of(rudy_global.history.begin(), rudy_global.history.end(),
+                       [](const GlobalPlacementIteration& row) { return row.rudy_active; }),
+           "RUDY-enabled global placement never activated its proxy term.");
+    expectMovablesInCore(rudy_database);
 
     PlacementDatabase controller_database = BookshelfParser().parseAux(fixture);
     InitialPlacementOptions controller_initial_options;
@@ -200,6 +255,42 @@ void runPlacementFlowTests() {
     }
     expect(rejected_invalid_controller_option,
            "Adaptive global placement accepted an invalid feasible-refinement limit.");
+
+    bool rejected_non_finite_global_option = false;
+    try {
+        PlacementDatabase invalid_options_database = BookshelfParser().parseAux(fixture);
+        GlobalPlacementOptions invalid_options;
+        invalid_options.target_density = std::numeric_limits<double>::quiet_NaN();
+        GlobalPlacer().run(invalid_options_database, invalid_options);
+    } catch (const std::invalid_argument&) {
+        rejected_non_finite_global_option = true;
+    }
+    expect(rejected_non_finite_global_option,
+           "Global placement accepted a non-finite public configuration value.");
+
+    bool rejected_unknown_global_mode = false;
+    try {
+        PlacementDatabase invalid_options_database = BookshelfParser().parseAux(fixture);
+        GlobalPlacementOptions invalid_options;
+        invalid_options.optimizer = static_cast<GlobalOptimizer>(99);
+        GlobalPlacer().run(invalid_options_database, invalid_options);
+    } catch (const std::invalid_argument&) {
+        rejected_unknown_global_mode = true;
+    }
+    expect(rejected_unknown_global_mode, "Global placement accepted an unknown optimizer mode.");
+
+    bool rejected_invalid_global_cuda_configuration = false;
+    try {
+        PlacementDatabase invalid_options_database = BookshelfParser().parseAux(fixture);
+        GlobalPlacementOptions invalid_options;
+        invalid_options.compute_backend = ComputeBackend::Auto;
+        invalid_options.cuda_device = 0;
+        GlobalPlacer().run(invalid_options_database, invalid_options);
+    } catch (const std::invalid_argument&) {
+        rejected_invalid_global_cuda_configuration = true;
+    }
+    expect(rejected_invalid_global_cuda_configuration,
+           "Global placement accepted an invalid CUDA device configuration.");
 
     const LegalityReport legality = Legalizer().legalize(database, {});
     expect(legality.legal, "Legalizer did not produce a legal tiny placement.");

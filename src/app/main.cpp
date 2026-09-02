@@ -2,6 +2,7 @@
 #include "myplacement/export/Renderer.hpp"
 #include "myplacement/io/BookshelfParser.hpp"
 #include "myplacement/metrics/Metrics.hpp"
+#include "myplacement/placement/DetailedPlacer.hpp"
 #include "myplacement/placement/GlobalPlacer.hpp"
 #include "myplacement/placement/InitialPlacer.hpp"
 #include "myplacement/placement/Legalizer.hpp"
@@ -33,6 +34,7 @@ struct CommandLine {
     InitialPlacementOptions initial_options;
     GlobalPlacementOptions global_options;
     LegalizationOptions legalization_options;
+    DetailedPlacementOptions detailed_options;
 };
 
 void printUsage(std::ostream& output) {
@@ -46,6 +48,16 @@ void printUsage(std::ostream& output) {
            << "  --bins <count>              Square density grid size\n"
            << "  --density-field <mode>      neumann (default) or periodic A/B baseline\n"
            << "  --global-optimizer <mode>   adaptive (default) or legacy A/B baseline\n"
+           << "  --routability-model <mode>  disabled (default), rudy_hinge_l2, rudy_softplus_l2, or rudy_hinge_l4\n"
+           << "  --rudy-bins <count>         Square RUDY proxy grid size (default: 64)\n"
+           << "  --rudy-validation-bins <n>  Held-out RUDY diagnostic grid; 0 disables it (default: 0)\n"
+           << "  --rudy-validation-capacity-factor <v>  Fixed capacity multiple for held-out scoring\n"
+           << "  --rudy-capacity-factor <v>  Activation-demand multiple used as fixed RUDY capacity (default: 1.0)\n"
+           << "  --rudy-weight <v>           Normalized RUDY-gradient emphasis (default: 0.20)\n"
+           << "  --rudy-start-overflow <v>   Enable RUDY after design density reaches this overflow\n"
+           << "  --rudy-ramp-iters <count>   Accepted steps used to ramp RUDY weight (default: 24)\n"
+           << "  --rudy-min-span-bins <v>    Minimum RUDY net span as a bin fraction (default: 0.25)\n"
+           << "  --rudy-softplus-temp <v>    Softplus utilization temperature (default: 0.10)\n"
            << "  --compute-backend <mode>    cpu (default), cuda, or auto\n"
            << "  --gpu-device <1..4>         Shared-server CUDA device (default: 1)\n"
            << "  --gpu-memory-limit-gib <n>  Explicit CUDA allocation cap, 1..40 (default: 40)\n"
@@ -53,6 +65,11 @@ void printUsage(std::ostream& output) {
            << "  --seed <integer>            Reproducible random seed\n"
            << "  --no-global                 Stop after initial placement\n"
            << "  --no-legalize               Do not run legalization\n"
+           << "  --legalizer <mode>          abacus (default) or greedy A/B baseline\n"
+           << "  --detailed-placement <mode> none (default), swap, or window\n"
+           << "  --detailed-backend <mode>   cpu (default), cuda, or auto\n"
+           << "  --detailed-passes <count>  Detailed-placement optimization passes\n"
+           << "  --detailed-window <count>  Detailed-placement window size, 2 through 6\n"
            << "  --no-bmp                    Do not render BMP images\n"
            << "  --no-gds                    Do not export GDSII\n"
            << "  --parse-only                Parse and validate input only\n"
@@ -98,6 +115,36 @@ CommandLine parseCommandLine(int argc, char* argv[]) {
                 parseDensityFieldBoundary(takeValue(index, argc, argv, argument));
         } else if (argument == "--global-optimizer") {
             command.global_options.optimizer = parseGlobalOptimizer(takeValue(index, argc, argv, argument));
+        } else if (argument == "--routability-model") {
+            command.global_options.rudy_options.penalty_model =
+                parseRudyPenaltyModel(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-bins") {
+            const int bins = std::stoi(takeValue(index, argc, argv, argument));
+            command.global_options.rudy_options.columns = bins;
+            command.global_options.rudy_options.rows = bins;
+        } else if (argument == "--rudy-validation-bins") {
+            command.global_options.rudy_validation_bins = std::stoi(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-validation-capacity-factor") {
+            command.global_options.rudy_validation_capacity_factor =
+                std::stod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-capacity-factor") {
+            command.global_options.rudy_options.capacity_factor =
+                std::stod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-weight") {
+            command.global_options.routability_weight_scale =
+                std::stod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-start-overflow") {
+            command.global_options.routability_start_overflow =
+                std::stod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-ramp-iters") {
+            command.global_options.routability_ramp_iterations =
+                std::stoi(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-min-span-bins") {
+            command.global_options.rudy_options.minimum_span_in_bins =
+                std::stod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--rudy-softplus-temp") {
+            command.global_options.rudy_options.softplus_temperature =
+                std::stod(takeValue(index, argc, argv, argument));
         } else if (argument == "--compute-backend") {
             command.global_options.compute_backend = parseComputeBackend(takeValue(index, argc, argv, argument));
         } else if (argument == "--gpu-device") {
@@ -105,6 +152,7 @@ CommandLine parseCommandLine(int argc, char* argv[]) {
             if (command.global_options.cuda_device < 1 || command.global_options.cuda_device > 4) {
                 throw std::invalid_argument("--gpu-device must be between 1 and 4 on this shared server.");
             }
+            command.detailed_options.cuda_device = command.global_options.cuda_device;
         } else if (argument == "--gpu-memory-limit-gib") {
             const unsigned long long gib = std::stoull(takeValue(index, argc, argv, argument));
             if (gib == 0ULL || gib > 40ULL) {
@@ -112,6 +160,7 @@ CommandLine parseCommandLine(int argc, char* argv[]) {
             }
             command.global_options.maximum_cuda_memory_bytes =
                 static_cast<std::size_t>(gib * 1024ULL * 1024ULL * 1024ULL);
+            command.detailed_options.maximum_cuda_memory_bytes = command.global_options.maximum_cuda_memory_bytes;
         } else if (argument == "--target-density") {
             command.global_options.target_density = std::stod(takeValue(index, argc, argv, argument));
         } else if (argument == "--seed") {
@@ -126,6 +175,18 @@ CommandLine parseCommandLine(int argc, char* argv[]) {
             command.run_global = false;
         } else if (argument == "--no-legalize") {
             command.run_legalization = false;
+        } else if (argument == "--legalizer") {
+            command.legalization_options.strategy =
+                parseLegalizationStrategy(takeValue(index, argc, argv, argument));
+        } else if (argument == "--detailed-placement") {
+            command.detailed_options.method = parseDetailedPlacementMethod(takeValue(index, argc, argv, argument));
+        } else if (argument == "--detailed-backend") {
+            command.detailed_options.compute_backend =
+                parseDetailedPlacementBackend(takeValue(index, argc, argv, argument));
+        } else if (argument == "--detailed-passes") {
+            command.detailed_options.passes = std::stoi(takeValue(index, argc, argv, argument));
+        } else if (argument == "--detailed-window") {
+            command.detailed_options.window_size = std::stoi(takeValue(index, argc, argv, argument));
         } else if (argument == "--no-bmp") {
             command.write_bitmap = false;
         } else if (argument == "--no-gds") {
@@ -177,28 +238,60 @@ void writeGlobalHistory(const std::filesystem::path& path, const GlobalPlacement
     std::ofstream output(path);
     if (!output) throw std::runtime_error("Unable to write global placement history: " + path.string());
     output << "iteration,hpwl,optimizer_overflow,design_overflow,smooth_wirelength,density_energy,objective,"
-              "penalty,smoothing,step_size,maximum_displacement,gradient_norm,curvature,backtracks,"
-              "momentum_restarted,accepted,best_checkpoint\n";
+              "penalty,smoothing,step_size,maximum_displacement,gradient_norm,curvature,rudy_energy,"
+              "rudy_proxy_overflow,rudy_maximum_utilization,rudy_weight,backtracks,momentum_restarted,"
+              "accepted,best_checkpoint,rudy_active\n";
     output << std::setprecision(12);
     for (const GlobalPlacementIteration& row : result.history) {
         output << row.iteration << ',' << row.hpwl << ',' << row.overflow << ',' << row.design_overflow << ','
                << row.smooth_wirelength << ',' << row.density_energy << ',' << row.objective << ',' << row.penalty
                << ',' << row.smoothing << ',' << row.step_size << ',' << row.maximum_displacement << ','
-               << row.gradient_norm << ',' << row.curvature << ',' << row.backtracks << ','
+               << row.gradient_norm << ',' << row.curvature << ',' << row.rudy_energy << ','
+               << row.rudy_proxy_overflow << ',' << row.rudy_maximum_utilization << ',' << row.rudy_weight << ','
+               << row.backtracks << ','
                << (row.momentum_restarted ? 1 : 0) << ',' << (row.accepted ? 1 : 0) << ','
-               << (row.best_checkpoint ? 1 : 0) << '\n';
+               << (row.best_checkpoint ? 1 : 0) << ',' << (row.rudy_active ? 1 : 0) << '\n';
     }
 }
 
 void writeOverview(const std::filesystem::path& path, const PlacementDatabase& database,
                    const WirelengthMetrics& wirelength, const DensityMetrics& density,
                    DensityFieldBoundary density_field_boundary, GlobalOptimizer optimizer,
-                   ComputeBackend requested_backend,
+                   ComputeBackend requested_backend, LegalizationStrategy legalization_strategy,
+                   RudyPenaltyModel rudy_model,
+                   const RudyOptions& rudy_options, double routability_start_overflow,
+                   double routability_weight_scale, int routability_ramp_iterations, int rudy_validation_bins,
+                   double rudy_validation_capacity_factor,
                    const GlobalPlacementResult* global_result,
-                   const LegalityReport* legality) {
+                   const LegalityReport* legality, const LegalityReport* legalization_report,
+                   DetailedPlacementMethod detailed_method,
+                   DetailedPlacementBackend detailed_backend,
+                   const DetailedPlacementResult* detailed_result) {
     std::ofstream output(path);
     if (!output) throw std::runtime_error("Unable to write overview: " + path.string());
     const DatabaseSummary summary = database.summary();
+    RudyEvaluation final_rudy;
+    RudyEvaluation final_rudy_validation;
+    bool has_final_rudy = false;
+    bool has_final_rudy_validation = false;
+    if (global_result != nullptr) {
+        const RudyCapacity rudy_capacity{global_result->rudy_metrics.horizontal_capacity,
+                                         global_result->rudy_metrics.vertical_capacity};
+        if (rudy_capacity.valid()) {
+            final_rudy = evaluateRudy(database, rudy_options, rudy_capacity);
+            has_final_rudy = true;
+        }
+        const RudyCapacity validation_capacity{global_result->rudy_validation_metrics.horizontal_capacity,
+                                               global_result->rudy_validation_metrics.vertical_capacity};
+        if (rudy_validation_bins > 0 && validation_capacity.valid()) {
+            RudyOptions validation_options = rudy_options;
+            validation_options.columns = rudy_validation_bins;
+            validation_options.rows = rudy_validation_bins;
+            validation_options.capacity_factor = rudy_validation_capacity_factor;
+            final_rudy_validation = evaluateRudy(database, validation_options, validation_capacity);
+            has_final_rudy_validation = true;
+        }
+    }
     output << std::setprecision(12)
            << "modules=" << summary.module_count << '\n'
            << "movable_modules=" << summary.movable_count << '\n'
@@ -209,6 +302,20 @@ void writeOverview(const std::filesystem::path& path, const PlacementDatabase& d
            << "density_field=" << toString(density_field_boundary) << '\n'
            << "global_optimizer=" << toString(optimizer) << '\n'
            << "compute_backend_requested=" << toString(requested_backend) << '\n'
+           << "legalization_strategy=" << toString(legalization_strategy) << '\n'
+           << "detailed_placement=" << toString(detailed_method) << '\n'
+           << "detailed_backend_requested=" << toString(detailed_backend) << '\n'
+           << "routability_metric=" << toString(rudy_model) << '\n'
+           << "rudy_grid_columns=" << rudy_options.columns << '\n'
+           << "rudy_grid_rows=" << rudy_options.rows << '\n'
+           << "rudy_capacity_factor=" << rudy_options.capacity_factor << '\n'
+           << "rudy_minimum_span_in_bins=" << rudy_options.minimum_span_in_bins << '\n'
+           << "rudy_softplus_temperature=" << rudy_options.softplus_temperature << '\n'
+           << "rudy_validation_bins=" << rudy_validation_bins << '\n'
+           << "rudy_validation_capacity_factor=" << rudy_validation_capacity_factor << '\n'
+           << "routability_start_overflow=" << routability_start_overflow << '\n'
+           << "routability_weight_scale=" << routability_weight_scale << '\n'
+           << "routability_ramp_iterations=" << routability_ramp_iterations << '\n'
            << "hpwl=" << wirelength.hpwl << '\n'
            << "density_metric=course_eplace_v1" << '\n'
            << "normalized_overflow=" << density.normalized_overflow << '\n'
@@ -231,6 +338,35 @@ void writeOverview(const std::filesystem::path& path, const PlacementDatabase& d
                << "compute_backend_used=" << toString(global_result->compute_backend_used) << '\n'
                << "cuda_device_used=" << global_result->cuda_device_used << '\n'
                << "cuda_reserved_memory_bytes=" << global_result->cuda_reserved_memory_bytes << '\n';
+        if (has_final_rudy) {
+            output << "rudy_evaluation_stage=final_database" << '\n'
+                   << "rudy_global_checkpoint_energy=" << global_result->rudy_energy_after << '\n'
+                   << "rudy_global_checkpoint_proxy_overflow="
+                   << global_result->rudy_metrics.proxy_overflow << '\n'
+                   << "rudy_energy=" << final_rudy.energy << '\n'
+                   << "rudy_proxy_overflow=" << final_rudy.metrics.proxy_overflow << '\n'
+                   << "rudy_maximum_utilization=" << final_rudy.metrics.maximum_utilization << '\n'
+                   << "rudy_p95_utilization=" << final_rudy.metrics.p95_utilization << '\n'
+                   << "rudy_horizontal_capacity=" << final_rudy.metrics.horizontal_capacity << '\n'
+                   << "rudy_vertical_capacity=" << final_rudy.metrics.vertical_capacity << '\n';
+        }
+        if (has_final_rudy_validation) {
+            output << "rudy_validation_global_checkpoint_energy="
+                   << global_result->rudy_validation_energy_after << '\n'
+                   << "rudy_validation_global_checkpoint_proxy_overflow="
+                   << global_result->rudy_validation_metrics.proxy_overflow << '\n'
+                   << "rudy_validation_energy=" << final_rudy_validation.energy << '\n'
+                   << "rudy_validation_proxy_overflow="
+                   << final_rudy_validation.metrics.proxy_overflow << '\n'
+                   << "rudy_validation_maximum_utilization="
+                   << final_rudy_validation.metrics.maximum_utilization << '\n'
+                   << "rudy_validation_p95_utilization="
+                   << final_rudy_validation.metrics.p95_utilization << '\n'
+                   << "rudy_validation_horizontal_capacity="
+                   << final_rudy_validation.metrics.horizontal_capacity << '\n'
+                   << "rudy_validation_vertical_capacity="
+                   << final_rudy_validation.metrics.vertical_capacity << '\n';
+        }
     }
     if (legality != nullptr) {
         output << "legal=" << (legality->legal ? "true" : "false") << '\n'
@@ -238,6 +374,34 @@ void writeOverview(const std::filesystem::path& path, const PlacementDatabase& d
                << "out_of_core_modules=" << legality->out_of_core_modules << '\n'
                << "off_row_modules=" << legality->off_row_modules << '\n'
                << "unplaced_standard_cells=" << legality->unplaced_standard_cells << '\n';
+    }
+    if (legalization_report != nullptr) {
+        output << "legalization_strategy_used=" << toString(legalization_report->strategy) << '\n'
+               << "legalization_reverse_pass_selected="
+               << (legalization_report->abacus_reverse_pass_selected ? "true" : "false") << '\n'
+               << "legalization_elapsed_seconds=" << legalization_report->elapsed_seconds << '\n'
+               << "standard_cell_total_displacement="
+               << legalization_report->standard_cell_total_displacement << '\n'
+               << "standard_cell_total_squared_displacement="
+               << legalization_report->standard_cell_total_squared_displacement << '\n'
+               << "standard_cell_weighted_squared_displacement="
+               << legalization_report->standard_cell_weighted_squared_displacement << '\n'
+               << "standard_cell_maximum_displacement="
+               << legalization_report->standard_cell_maximum_displacement << '\n';
+    }
+    if (detailed_result != nullptr) {
+        output << "detailed_hpwl_before=" << detailed_result->hpwl_before << '\n'
+               << "detailed_hpwl_after=" << detailed_result->hpwl_after << '\n'
+               << "detailed_elapsed_seconds=" << detailed_result->elapsed_seconds << '\n'
+               << "detailed_completed_passes=" << detailed_result->completed_passes << '\n'
+               << "detailed_evaluated_windows=" << detailed_result->evaluated_windows << '\n'
+               << "detailed_evaluated_permutations=" << detailed_result->evaluated_permutations << '\n'
+               << "detailed_accepted_operations=" << detailed_result->accepted_operations << '\n'
+               << "detailed_compute_backend_used="
+               << toString(detailed_result->compute_backend_used) << '\n'
+               << "detailed_cuda_device_used=" << detailed_result->cuda_device_used << '\n'
+               << "detailed_cuda_reserved_memory_bytes="
+               << detailed_result->cuda_reserved_memory_bytes << '\n';
     }
 }
 
@@ -306,14 +470,44 @@ int main(int argc, char* argv[]) {
         }
 
         LegalityReport legality;
+        LegalityReport legalization_report;
         const LegalityReport* legality_pointer = nullptr;
+        const LegalityReport* legalization_report_pointer = nullptr;
         if (command.run_legalization) {
             legality = Legalizer().legalize(database, command.legalization_options);
+            legalization_report = legality;
             legality_pointer = &legality;
-            std::cout << "Legalization: " << (legality.legal ? "PASS" : "CHECK REQUIRED")
+            legalization_report_pointer = &legalization_report;
+            std::cout << "Legalization [" << toString(legality.strategy)
+                      << (legality.abacus_reverse_pass_selected ? ", reverse" : "") << "]: "
+                      << (legality.legal ? "PASS" : "CHECK REQUIRED")
                       << ", overlaps=" << legality.overlap_pairs << ", off-row=" << legality.off_row_modules
-                      << ", unplaced=" << legality.unplaced_standard_cells << '\n';
+                      << ", unplaced=" << legality.unplaced_standard_cells
+                      << ", std-cell movement=" << legality.standard_cell_total_displacement
+                      << ", time=" << legality.elapsed_seconds << " s\n";
             if (command.write_bitmap) renderer.writeBitmap(database, command.output_directory / "04_legalized.bmp");
+        }
+
+        DetailedPlacementResult detailed_result;
+        const DetailedPlacementResult* detailed_result_pointer = nullptr;
+        if (command.detailed_options.method != DetailedPlacementMethod::None) {
+            if (!command.run_legalization) {
+                throw std::invalid_argument("Detailed placement requires legalization; remove --no-legalize.");
+            }
+            detailed_result = DetailedPlacer().run(database, command.detailed_options);
+            detailed_result_pointer = &detailed_result;
+            legality = Legalizer().check(database, command.legalization_options.epsilon);
+            legality_pointer = &legality;
+            std::cout << "Detailed placement [" << toString(command.detailed_options.method) << ", "
+                      << toString(detailed_result.compute_backend_used) << "]: HPWL "
+                      << detailed_result.hpwl_before << " -> " << detailed_result.hpwl_after
+                      << ", accepted=" << detailed_result.accepted_operations
+                      << ", windows=" << detailed_result.evaluated_windows << " in "
+                      << detailed_result.elapsed_seconds << " s\n";
+            if (!legality.legal) {
+                throw std::runtime_error("Detailed placement violated legalization constraints.");
+            }
+            if (command.write_bitmap) renderer.writeBitmap(database, command.output_directory / "05_detailed.bmp");
         }
 
         if (command.write_gds) {
@@ -325,8 +519,16 @@ int main(int argc, char* argv[]) {
                                                         command.global_options.target_density);
         writeOverview(command.output_directory / "overview.txt", database, wirelength, density,
                       command.global_options.density_field_boundary, command.global_options.optimizer,
-                      command.global_options.compute_backend,
-                      global_result_pointer, legality_pointer);
+                      command.global_options.compute_backend, command.legalization_options.strategy,
+                      command.global_options.rudy_options.penalty_model,
+                      command.global_options.rudy_options, command.global_options.routability_start_overflow,
+                      command.global_options.routability_weight_scale,
+                      command.global_options.routability_ramp_iterations,
+                      command.global_options.rudy_validation_bins,
+                      command.global_options.rudy_validation_capacity_factor,
+                      global_result_pointer, legality_pointer, legalization_report_pointer,
+                      command.detailed_options.method, command.detailed_options.compute_backend,
+                      detailed_result_pointer);
         std::cout << "Outputs written to " << command.output_directory << '\n';
         return legality_pointer != nullptr && !legality_pointer->legal ? 2 : 0;
     } catch (const std::exception& exception) {
