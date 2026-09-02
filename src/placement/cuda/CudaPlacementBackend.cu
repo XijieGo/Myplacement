@@ -1,5 +1,7 @@
 #include "../CudaPlacementBackend.hpp"
 
+#include "myplacement/placement/CudaDevicePolicy.hpp"
+
 #include <cuda_runtime.h>
 #include <cufft.h>
 
@@ -1160,8 +1162,8 @@ std::unique_ptr<CudaPlacementBackend> tryCreateCudaPlacementBackend(
         reason = "The CUDA backend currently implements the physical Neumann/DCT field only.";
         return nullptr;
     }
-    if (options.cuda_device < 1 || options.cuda_device > 4) {
-        reason = "CUDA device must be in the shared-server allowance 1 through 4.";
+    if (!isPermittedCudaDevice(options.cuda_device)) {
+        reason = "CUDA device must be in the shared-server allowance 1 through 4 or 7.";
         return nullptr;
     }
 

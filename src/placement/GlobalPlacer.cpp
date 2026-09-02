@@ -1,5 +1,7 @@
 #include "myplacement/placement/GlobalPlacer.hpp"
 
+#include "myplacement/placement/CudaDevicePolicy.hpp"
+
 #include "GlobalPlacementInternal.hpp"
 
 #include <algorithm>
@@ -89,8 +91,9 @@ void validatePublicGlobalOptions(const GlobalPlacementOptions& options) {
         throw std::invalid_argument("Global placement options contain an unknown mode or non-finite value.");
     }
     if (options.compute_backend != ComputeBackend::Cpu &&
-        (options.cuda_device < 1 || options.cuda_device > 4 || options.maximum_cuda_memory_bytes == 0U)) {
-        throw std::invalid_argument("CUDA global placement requires a device in [1, 4] and a non-zero memory budget.");
+        (!isPermittedCudaDevice(options.cuda_device) || options.maximum_cuda_memory_bytes == 0U)) {
+        throw std::invalid_argument(
+            "CUDA global placement requires device 1 through 4 or 7 and a non-zero memory budget.");
     }
 }
 

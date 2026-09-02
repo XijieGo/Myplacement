@@ -71,7 +71,7 @@ struct GlobalPlacementOptions {
     DensityFieldBoundary density_field_boundary = DensityFieldBoundary::Neumann;
     ComputeBackend compute_backend = ComputeBackend::Cpu;
     // This project is hosted on a shared server where placement jobs may use
-    // only physical GPUs 1 through 4. The CUDA backend enforces that policy.
+    // only physical GPUs 1 through 4 or GPU 7. The CUDA backend enforces that policy.
     int cuda_device = 1;
     // Explicit device allocations are budgeted before any CUDA allocation.
     // Keep the default below the 80 GiB device capacity and leave room for

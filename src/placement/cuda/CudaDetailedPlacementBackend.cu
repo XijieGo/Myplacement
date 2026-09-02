@@ -1,6 +1,7 @@
 #include "../CudaDetailedPlacementBackend.hpp"
 
 #include "myplacement/metrics/Metrics.hpp"
+#include "myplacement/placement/CudaDevicePolicy.hpp"
 
 #include <cuda_runtime.h>
 
@@ -515,7 +516,7 @@ bool tryRunCudaDetailedPlacement(PlacementDatabase& database, const DetailedPlac
         return false;
     }
     if (options.passes <= 0 || options.maximum_net_degree < 2U || options.improvement_epsilon < 0.0 ||
-        options.cuda_device < 1 || options.cuda_device > 4 || options.maximum_cuda_memory_bytes == 0U) {
+        !isPermittedCudaDevice(options.cuda_device) || options.maximum_cuda_memory_bytes == 0U) {
         reason = "CUDA detailed-placement options are outside their valid range.";
         return false;
     }

@@ -235,7 +235,7 @@ ctest --test-dir build-asan --output-on-failure
 --density-field neumann|periodic  默认闭边界 DCT；周期性 FFT 仅作 A/B 基线
 --global-optimizer adaptive|legacy  默认闭环自适应；legacy 用于开环基线对照
 --compute-backend cpu|cuda|auto  默认 CPU；CUDA 仅支持 adaptive + neumann
---gpu-device <1..4>       本共享服务器允许的 GPU 编号，显式 CUDA 时建议先检查空闲卡
+--gpu-device <1..4,7>     本共享服务器允许的 GPU 编号，显式 CUDA 时建议先检查空闲卡
 --gpu-memory-limit-gib <n>  CUDA 显式分配上限，范围 1..40，默认 40
 --target-density <value>   目标密度
 --no-global                只运行初始布局

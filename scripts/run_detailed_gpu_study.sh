@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
-    echo "Usage: $0 <build-dir> <design.aux> <output-dir> <gpu-device-1..4> [myplace options...]" >&2
+    echo "Usage: $0 <build-dir> <design.aux> <output-dir> <gpu-device-1..4-or-7> [myplace options...]" >&2
     exit 2
 fi
 
@@ -24,8 +24,8 @@ if [[ ! -f "${detail_aux_file}" ]]; then
     echo "Missing BookShelf AUX file: ${detail_aux_file}" >&2
     exit 2
 fi
-if [[ ! "${detail_gpu_device}" =~ ^[1-4]$ ]]; then
-    echo "GPU device must be in 1..4 on this shared server." >&2
+if [[ ! "${detail_gpu_device}" =~ ^[1-4]$ && "${detail_gpu_device}" != "7" ]]; then
+    echo "GPU device must be 1..4 or 7 on this shared server." >&2
     exit 2
 fi
 if ! command -v nvidia-smi >/dev/null 2>&1; then

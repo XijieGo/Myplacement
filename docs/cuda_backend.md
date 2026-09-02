@@ -38,7 +38,7 @@ HPWL。GPU 返回最优候选后，CPU 会在当前数据库上重新计算精�
 `overview.txt` 会记录 `detailed_backend_requested`、实际使用后端、GPU 编号、显存预算、窗口数和候选数。
 
 共享服务器的大基准不要直接执行上述 tiny 命令模式。应使用
-`scripts/run_detailed_gpu_study.sh`：它会连续两次确认 GPU 1--4 的利用率低于阈值并保留显存余量，当前
+`scripts/run_detailed_gpu_study.sh`：它会连续两次确认允许的 GPU 1--4 或 7 的利用率低于阈值并保留显存余量，当前
 高利用率卡会被拒绝而不是抢占。完整 QoR 对照与 GPU 运行时证据边界见
 [a100_quality_strategy.md](a100_quality_strategy.md)。
 
@@ -78,17 +78,17 @@ cmake --build build-cuda --parallel 16
 
 ## 共享服务器安全规则
 
-本服务器只允许布局任务使用物理 GPU `1` 到 `4`。开始 GPU 大基准前先人工检查状态，并显式选择
+本服务器当前允许布局任务使用物理 GPU `1` 到 `4` 或 `7`。开始 GPU 大基准前先人工检查状态，并显式选择
 空闲卡：
 
 ```bash
-nvidia-smi -i 1,2,3,4 \
+nvidia-smi -i 1,2,3,4,7 \
   --query-gpu=index,memory.free,utilization.gpu --format=csv,noheader
 ```
 
 程序也会执行以下防护：
 
-- 拒绝 `1` 到 `4` 之外的 GPU 编号；
+- 拒绝 `1` 到 `4` 及 `7` 之外的 GPU 编号；
 - 默认显式 CUDA 分配上限为 40 GiB，命令行上限同样不能超过 40 GiB；
 - 创建后端前读取当前空闲显存，并额外保留 4 GiB 给共享任务；
 - 不使用 Unified Memory（统一内存）或隐式显存溢出；所有持久数组和 cuFFT 工作区均计入预算；
@@ -146,7 +146,11 @@ M_payload = 76P + 40I + 92N + 240B²
 | `adaptec1` | 随机初始、64×64、16 轮、无 BMP/GDS/合法化 | CPU/GPU 历史逐行一致；GPU 全局阶段 1.127 s，CPU 为 4.908 s，约 4.35 倍加速。 |
 | `adaptec4` | 随机初始、64×64、16 轮、无 BMP/GDS/合法化、GPU 4 | 质量与控制决策一致；GPU 为 2.497 s，CPU 为 10.406 s，约 4.17 倍加速。 |
 | `adaptec4` | 随机初始、1024×1024、16 轮、GPU 4 | 显式数据 398 MiB，实测进程峰值 845 MiB；未接近 2 GiB 测试上限。 |
+| `adaptec1` | 当前 Abacus/reverse、160 轮、GPU 7，CPU-global/GPU-detail 配对 | GPU 详细阶段 0.580 s，CPU 为 2.865 s，4.94×；同起点最终 HPWL 差 0.0682%，均合法。 |
+| `adaptec1` | 当前 Abacus/reverse、160 轮、全 CUDA、GPU 7 | 全局 6.127 s、详细 0.593 s；阶段合计相对 CPU 5.16×，最终 HPWL 低 0.8347%。 |
+| `adaptec4` | 当前 Abacus/reverse、280 轮、全 CUDA、GPU 7 | 全局 24.771 s、详细 1.541 s，最终合法 HPWL 1,132,194,492；全局/详细显式预算约 159/75 MiB。 |
 
 GPU 并行归约在一般输入上不承诺逐比特相同，但它必须保持解析测试、课程密度指标、合法性、控制决策
-和最终质量一致。`tiny`、`mixed` 与 `adaptec1` 的受控历史逐行一致；更大的 `adaptec4` 只出现浮点
-归约末位差异（约 `1e-12` 相对量级）。后续任何 CUDA 优化都应继续以 CPU 后端为基准。
+和最终质量一致。`tiny`、`mixed` 与 16 轮 `adaptec1` 的受控历史逐行一致；更大的 `adaptec4` 只出现浮点
+归约末位差异（约 `1e-12` 相对量级）。160 轮 A1 端到端实测则按最终合法 QoR 与运行时比较，见上表。后续任何
+CUDA 优化都应继续以 CPU 后端为基准。

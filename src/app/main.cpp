@@ -2,6 +2,7 @@
 #include "myplacement/export/Renderer.hpp"
 #include "myplacement/io/BookshelfParser.hpp"
 #include "myplacement/metrics/Metrics.hpp"
+#include "myplacement/placement/CudaDevicePolicy.hpp"
 #include "myplacement/placement/DetailedPlacer.hpp"
 #include "myplacement/placement/GlobalPlacer.hpp"
 #include "myplacement/placement/InitialPlacer.hpp"
@@ -59,7 +60,7 @@ void printUsage(std::ostream& output) {
            << "  --rudy-min-span-bins <v>    Minimum RUDY net span as a bin fraction (default: 0.25)\n"
            << "  --rudy-softplus-temp <v>    Softplus utilization temperature (default: 0.10)\n"
            << "  --compute-backend <mode>    cpu (default), cuda, or auto\n"
-           << "  --gpu-device <1..4>         Shared-server CUDA device (default: 1)\n"
+           << "  --gpu-device <1..4,7>       Permitted shared-server CUDA device (default: 1)\n"
            << "  --gpu-memory-limit-gib <n>  Explicit CUDA allocation cap, 1..40 (default: 40)\n"
            << "  --target-density <value>    Target density in (0, 1]\n"
            << "  --seed <integer>            Reproducible random seed\n"
@@ -149,8 +150,8 @@ CommandLine parseCommandLine(int argc, char* argv[]) {
             command.global_options.compute_backend = parseComputeBackend(takeValue(index, argc, argv, argument));
         } else if (argument == "--gpu-device") {
             command.global_options.cuda_device = std::stoi(takeValue(index, argc, argv, argument));
-            if (command.global_options.cuda_device < 1 || command.global_options.cuda_device > 4) {
-                throw std::invalid_argument("--gpu-device must be between 1 and 4 on this shared server.");
+            if (!isPermittedCudaDevice(command.global_options.cuda_device)) {
+                throw std::invalid_argument("--gpu-device must be 1 through 4 or 7 on this shared server.");
             }
             command.detailed_options.cuda_device = command.global_options.cuda_device;
         } else if (argument == "--gpu-memory-limit-gib") {
@@ -335,6 +336,7 @@ void writeOverview(const std::filesystem::path& path, const PlacementDatabase& d
                << "global_best_checkpoint_overflow=" << global_result->best_checkpoint_overflow << '\n'
                << "global_restored_best_checkpoint="
                << (global_result->restored_best_checkpoint ? "true" : "false") << '\n'
+               << "global_elapsed_seconds=" << global_result->elapsed_seconds << '\n'
                << "compute_backend_used=" << toString(global_result->compute_backend_used) << '\n'
                << "cuda_device_used=" << global_result->cuda_device_used << '\n'
                << "cuda_reserved_memory_bytes=" << global_result->cuda_reserved_memory_bytes << '\n';
